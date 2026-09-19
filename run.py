@@ -21,11 +21,16 @@ of the working directory it's invoked from.
 
 Model: "Shipped" (plain NAFNet-full, bicubic-first trunk, PixelShuffle
 decoder, 29.07M params) -- see README.md for the architecture brief.
-Inference runs at fp16 + channels_last + batch=8 on GPU (zero measured
-quality cost from fp16 alone, ~3x throughput over plain fp32); falls back
-to fp32, batch=1 on CPU. Inputs are grouped into batches of up to 8, split
-whenever resolution changes, so mixed-resolution folders still work
-correctly -- this project's own data is uniformly 128x128.
+Inference runs at fp16 + channels_last + torch.compile(mode=
+"reduce-overhead") + batch=8 on GPU (zero measured quality cost from fp16
+alone; compile adds a one-time warmup cost on the first batch in exchange
+for materially higher steady-state throughput). Falls back to fp32,
+batch=1, uncompiled on CPU. If torch.compile fails for any reason (older
+PyTorch, unsupported GPU, etc.) this script catches it and automatically
+falls back to the uncompiled fp16 model rather than crashing. Inputs are
+grouped into batches of up to 8, split whenever resolution changes, so
+mixed-resolution folders still work correctly -- this project's own data
+is uniformly 128x128.
 """
 import argparse
 import os
@@ -87,8 +92,16 @@ def main():
     ckpt = torch.load(CHECKPOINT_PATH, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model_state"])
     model = model.to(device).to(dtype).eval()
+    model_eager = model  # kept as an uncompiled fallback if torch.compile fails
     if use_fp16:
         model = model.to(memory_format=torch.channels_last)
+        model_eager = model
+        try:
+            model = torch.compile(model, mode="reduce-overhead")
+        except Exception as e:
+            print(f"[run] WARNING: torch.compile unavailable ({e}); "
+                  f"continuing uncompiled (fp16 + channels_last only).", file=sys.stderr)
+            model = model_eager
         torch.backends.cudnn.benchmark = True
 
     t_model_ready = time.time()
@@ -98,15 +111,45 @@ def main():
     if not input_files:
         print(f"[run] WARNING: no .npy files found in {args.input_dir}", file=sys.stderr)
 
+    # torch.compile(mode="reduce-overhead") uses CUDA Graphs, which only pay
+    # off when the input tensor sits at a FIXED GPU memory address on every
+    # call -- a fresh tensor built from newly-loaded numpy data each batch
+    # (a different address every time) defeats that, and can even make the
+    # graph-managed path slower than plain eager. So: one persistent input
+    # buffer, sized to the first full-size batch seen, refreshed in place
+    # via copy_() each iteration -- that's what actually lets the compiled
+    # graph replay fast. A batch that doesn't match that buffer's shape
+    # (a short final batch, or a different resolution) runs on the eager
+    # model instead, since CUDA Graphs can't handle a shape change either.
+    static_buffer = None
+    fell_back = False
     n_written = 0
     with torch.no_grad():
         for names, arr in load_batches(input_files, args.input_dir, BATCH_SIZE):
             lr = torch.from_numpy(arr).unsqueeze(1).to(device)  # (B,1,H,W)
-            bicubic = bicubic_upsample(lr, scale=2)
-            bicubic = bicubic.to(dtype)
-            if use_fp16:
-                bicubic = bicubic.to(memory_format=torch.channels_last)
-            out = model(bicubic)
+            bicubic = bicubic_upsample(lr, scale=2).to(dtype)
+
+            use_compiled = (
+                model is not model_eager and not fell_back
+                and bicubic.shape[0] == BATCH_SIZE
+            )
+            if use_compiled:
+                if static_buffer is None or static_buffer.shape != bicubic.shape:
+                    static_buffer = torch.empty_like(bicubic).to(memory_format=torch.channels_last)
+                static_buffer.copy_(bicubic)
+                try:
+                    out = model(static_buffer)
+                except Exception as e:
+                    print(f"[run] WARNING: compiled forward pass failed ({e}); "
+                          f"falling back to uncompiled fp16 for the rest of the run.", file=sys.stderr)
+                    fell_back = True
+                    bicubic_e = bicubic.to(memory_format=torch.channels_last) if use_fp16 else bicubic
+                    out = model_eager(bicubic_e)
+            else:
+                if use_fp16:
+                    bicubic = bicubic.to(memory_format=torch.channels_last)
+                out = model_eager(bicubic)
+
             out_np = out.float().cpu().numpy()
             for i, fname in enumerate(names):
                 np.save(os.path.join(args.output_dir, fname), out_np[i, 0])
