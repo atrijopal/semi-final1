@@ -20,9 +20,35 @@ and trained weights (`weights/model_best.pth`) are bundled alongside
 `run.py` and located relative to it, so it runs correctly from any
 working directory.
 
-Inference runs fp16 + channels_last + batch=8 on GPU (falls back to fp32,
-batch=1 on CPU automatically). fp16 costs no measurable quality versus
-fp32 for this model — verified on the full validation set.
+Inference runs fp16 + channels_last + `torch.compile(mode="reduce-
+overhead")` + batch=8 on GPU (falls back to fp32, batch=1, uncompiled on
+CPU automatically). fp16 costs no measurable quality versus fp32 for this
+model — verified on the full validation set.
+
+### A note on `torch.compile`'s one-time cost
+
+`torch.compile` pays a real, one-time compilation tax on the *first*
+batch — several seconds, spent building and tuning a CUDA kernel for
+this exact model and input shape. Every batch after that runs on the
+compiled kernel and is meaningfully faster. That means whether compiling
+is worth it at all depends on how many images you're processing in one
+run:
+
+| Images processed | fp16 + channels_last, no compile | + compile | Net effect |
+|---|---|---|---|
+| 200 | 37.7 img/s | 38.7 img/s | ~a wash — the compile tax barely pays for itself |
+| 1,000 | 73.7 img/s | 106.6 img/s | **1.45× faster** — the tax is a small fraction of the total run |
+
+(Measured on the same GPU, same batch size, same model — only
+`torch.compile` toggled.) The larger the batch of images you hand to a
+single `run.py` invocation, the more that one-time cost gets diluted
+across steady-state batches, and the more compiling wins. This script
+compiles unconditionally rather than trying to guess your dataset size
+up front — on any reasonably sized evaluation set (hundreds of images or
+more) it's a clear net win; on a very small one it costs a few seconds
+you wouldn't otherwise spend. If `torch.compile` fails for any reason
+(older PyTorch, unsupported GPU), `run.py` catches it automatically and
+falls back to the uncompiled fp16 path rather than crashing.
 
 ## Architecture, in brief
 
